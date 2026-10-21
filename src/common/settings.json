@@ -23,7 +23,7 @@
         "name": "allocator_background_threads",
         "description": "Whether to enable the allocator background threads.",
         "type": "BOOLEAN",
-        "default_scope": "global",
+        "scope": "global",
         "default_value": "false",
         "on_callbacks": [
             "set"

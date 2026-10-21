@@ -1,0 +1,56 @@
+# name: test/sql/settings/allocator_background_threads_scope.test
+# description: allocator_background_threads controls a process-wide allocator option and can only be set globally
+# group: [settings]
+
+statement ok
+SET GLOBAL allocator_background_threads = true;
+
+query I
+SELECT current_setting('allocator_background_threads');
+----
+true
+
+statement error
+SET SESSION allocator_background_threads = false;
+----
+can only be set globally
+
+statement error
+RESET SESSION allocator_background_threads;
+----
+can only be set globally
+
+query I
+SELECT current_setting('allocator_background_threads');
+----
+true
+
+statement ok
+RESET allocator_background_threads;
+
+query I
+SELECT current_setting('allocator_background_threads');
+----
+false
+
+statement ok
+SET allocator_background_threads = true;
+
+query I
+SELECT current_setting('allocator_background_threads');
+----
+true
+
+# the value is global, so other connections see it and RESET GLOBAL restores the default for everyone
+query I con2
+SELECT current_setting('allocator_background_threads');
+----
+true
+
+statement ok con2
+RESET GLOBAL allocator_background_threads;
+
+query I con1
+SELECT current_setting('allocator_background_threads');
+----
+false
