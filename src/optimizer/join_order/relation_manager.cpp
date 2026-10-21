@@ -36,7 +36,6 @@ static bool CanReuseAlignedStats(const LogicalOperator &op) {
 	}
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_FILTER:
-	case LogicalOperatorType::LOGICAL_LIMIT:
 	case LogicalOperatorType::LOGICAL_ORDER_BY:
 	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 		return true;
@@ -178,6 +177,8 @@ static bool OperatorIsNonReorderable(const LogicalOperator &op) {
 			}
 		}
 		return false;
+	// a LIMIT is a boundary: filters and joins below it must not be moved above it
+	case LogicalOperatorType::LOGICAL_LIMIT:
 	case LogicalOperatorType::LOGICAL_UNION:
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT:
@@ -313,16 +314,6 @@ static bool HasNonReorderableChild(LogicalOperator &op) {
 	return tmp->children.empty();
 }
 
-static void ModifyStatsIfLimit(optional_ptr<LogicalOperator> limit_op, RelationStats &stats) {
-	if (!limit_op) {
-		return;
-	}
-	auto &limit = limit_op->Cast<LogicalLimit>();
-	if (limit.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-		stats.cardinality = MinValue(limit.limit_val.GetConstantValue(), stats.cardinality);
-	}
-}
-
 static optional<RelationStats> CombineNonReorderableStats(LogicalOperator &op, const vector<RelationStats> &child_stats,
                                                           ClientContext &context) {
 	if (child_stats.size() != op.children.size()) {
@@ -390,7 +381,7 @@ static optional<RelationStats> CombineNonReorderableStats(LogicalOperator &op, c
 
 bool RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, LogicalOperator &op,
                                               LogicalOperator &input_op, optional_ptr<LogicalOperator> parent,
-                                              RelationStats &child_stats, optional_ptr<LogicalOperator> limit_op,
+                                              RelationStats &child_stats,
                                               vector<reference<LogicalOperator>> &datasource_filters) {
 	D_ASSERT(!op.children.empty());
 	auto child_optimizer = optimizer.CreateChildOptimizer();
@@ -405,7 +396,6 @@ bool RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
 		operator_stats->cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats->cardinality) *
 		                                                      RelationStatisticsHelper::DEFAULT_SELECTIVITY);
 	}
-	ModifyStatsIfLimit(limit_op.get(), *operator_stats);
 	return AddRelation(input_op, parent, *operator_stats);
 }
 
@@ -414,7 +404,6 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
                                            optional_ptr<LogicalOperator> parent) {
 	optional_ptr<LogicalOperator> op = &input_op;
 	vector<reference<LogicalOperator>> datasource_filters;
-	optional_ptr<LogicalOperator> limit_op = nullptr;
 	// pass through single child operators (but never past a non-reorderable op such as a DML node, which
 	// must be preserved as its own relation rather than skipped over and dropped during reconstruction)
 	while (op->children.size() == 1 && !OperatorNeedsRelation(op->type) && !OperatorIsNonReorderable(*op)) {
@@ -423,9 +412,6 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 				datasource_filters.push_back(*op);
 			}
 			filter_operators.push_back(*op);
-		}
-		if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
-			limit_op = op;
 		}
 		op = op->children[0].get();
 	}
@@ -490,7 +476,6 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 			operator_stats->cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats->cardinality) *
 			                                                      RelationStatisticsHelper::DEFAULT_SELECTIVITY);
 		}
-		ModifyStatsIfLimit(limit_op.get(), child_stats);
 		return AddRelation(input_op, parent, *operator_stats);
 	}
 	case LogicalOperatorType::LOGICAL_WINDOW: {
@@ -510,13 +495,12 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 			operator_stats->cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats->cardinality) *
 			                                                      RelationStatisticsHelper::DEFAULT_SELECTIVITY);
 		}
-		ModifyStatsIfLimit(limit_op.get(), child_stats);
 		return AddRelation(input_op, parent, *operator_stats);
 	}
 	case LogicalOperatorType::LOGICAL_UNNEST: {
 		// optimize children of unnest
 		RelationStats child_stats;
-		return AddRelationWithChildren(optimizer, *op, input_op, parent, child_stats, limit_op, datasource_filters);
+		return AddRelationWithChildren(optimizer, *op, input_op, parent, child_stats, datasource_filters);
 	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
 		auto &join = op->Cast<LogicalComparisonJoin>();
@@ -579,7 +563,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		// be used in joins
 		if (!op->children.empty()) {
 			RelationStats child_stats;
-			return AddRelationWithChildren(optimizer, *op, input_op, parent, child_stats, limit_op, datasource_filters);
+			return AddRelationWithChildren(optimizer, *op, input_op, parent, child_stats, datasource_filters);
 		}
 		auto stats = RelationStatisticsHelper::ExtractGetStats(get, context);
 		// if there is another logical filter that could not be pushed down into the
@@ -589,7 +573,6 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 			stats.cardinality =
 			    (idx_t)MaxValue(double(stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
 		}
-		ModifyStatsIfLimit(limit_op.get(), stats);
 		return AddRelation(input_op, parent, stats);
 	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
@@ -605,7 +588,6 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 			return false;
 		}
 		proj.SetEstimatedCardinality(proj_stats->cardinality);
-		ModifyStatsIfLimit(limit_op.get(), *proj_stats);
 		if (!AddRelation(input_op, parent, *proj_stats)) {
 			return false;
 		}

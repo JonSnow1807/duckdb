@@ -1,0 +1,79 @@
+# name: test/sql/optimizer/joins/join_order_limit_boundary.test
+# description: Issue #27633 - the join order optimizer must not move filters or joins across a LIMIT
+# group: [joins]
+
+statement ok
+CREATE TABLE t1(c0 INTEGER);
+
+statement ok
+INSERT INTO t1 VALUES (1);
+
+statement ok
+CREATE TABLE t2(c3 BOOLEAN);
+
+statement ok
+INSERT INTO t2 VALUES (NULL), (true);
+
+statement ok
+CREATE TABLE t3(c3 BOOLEAN);
+
+statement ok
+INSERT INTO t3 VALUES (NULL), (false);
+
+statement ok
+CREATE TABLE t4(c3 BOOLEAN);
+
+statement ok
+INSERT INTO t4 VALUES (NULL), (true), (true);
+
+# without filter pushdown the SEMI JOIN becomes a cross product with LIMIT 1 over the filtered right side
+foreach disabled '' 'filter_pushdown'
+
+statement ok
+SET disabled_optimizers=${disabled};
+
+# the self join keeps the single row of t1, and t2 has a row where c3 is true
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 SEMI JOIN t2 ON t2.c3);
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 ANTI JOIN t2 ON t2.c3);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 SEMI JOIN t2 ON NOT t2.c3);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 ANTI JOIN t2 ON NOT t2.c3);
+----
+1
+
+# no row of t3 satisfies the condition
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 SEMI JOIN t3 ON t3.c3);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 ANTI JOIN t3 ON t3.c3);
+----
+1
+
+# the same with a filter that is pushed down as a datasource filter
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 SEMI JOIN t2 ON t2.c3 IS NOT NULL);
+----
+1
+
+# a join below the LIMIT used to be merged into the outer join graph, dropping the LIMIT altogether
+query I
+SELECT count(*) FROM (SELECT 2 AS a0 FROM t1 AS a JOIN t1 AS b ON a.c0 = b.c0 SEMI JOIN (t4 x JOIN t4 y ON x.c3 = y.c3) ON true);
+----
+1
+
+endloop
